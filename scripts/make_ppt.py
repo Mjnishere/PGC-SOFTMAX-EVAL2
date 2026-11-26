@@ -104,7 +104,7 @@ lead(s, "Parallelism at two levels: across rows (blocks) and across the elements
 s = new(True); head(s, "Design", "Separate kernels versus one fused kernel")
 stages(s, [("Read x", "global memory"), ("max", "block reduction"), ("Read x again", "global memory"), ("Σ exp(x−m)", "block reduction"), ("Read x, write y", "normalise")], hi=(1, 3))
 lead(s, "Separate: 3 launches, 4 global accesses per element. Fused: 1 launch, row cached in shared memory, 2 accesses per element (1 read, 1 write).", 4.0, 17)
-tx(s, .7, 5.1, 11.9, 1.2, ["Extra variants measured: online softmax (running max + rescaled sum, 3 accesses), warp-per-row (registers, no __syncthreads), fused with __expf, and PyTorch softmax as a library baseline."], 15, MUTE)
+tx(s, .7, 5.1, 11.9, 1.2, ["Extra variants measured: online softmax (running max + rescaled sum, 3 accesses), warp-per-row (registers, no __syncthreads), fused with __expf."], 15, MUTE)
 # 5 setup
 s = new(False); head(s, "Experimental setup", "Hardware, software and method")
 table(s, .7, 1.9, 11.9, [["GPU", f"{GPU}, {g.get('MemGB','?')} GB, {g.get('SMs','?')} SMs, compute capability {g.get('CC','?')}, L2 {g.get('L2 MB','?')} MB"], ["Software", f"CUDA {cuda_release()} (nvcc), driver {driver_ver()}, Ubuntu on WSL2"],

@@ -1,419 +1,373 @@
-Softmax and Kernel Fusion in CUDA
+# Softmax and Kernel Fusion in CUDA
 
-Parallel & Distributed Computing Laboratory · KLE Technological University (KLETECH), Hubballi
+**Parallel & Distributed Computing Laboratory** · KLE Technological University (KLETECH), Hubballi
+**Team:** Mudit Nayak · Kartik · Manoj · Vinayak  ·  **Evaluation theme:** 10 (Softmax and Kernel Fusion)
 
-Team: Mudit Nayak · Kartik · Manoj · Vinayak
+A CUDA study of the row-wise softmax used in classifiers and attention: three separate kernels, a fused shared-memory kernel, an online (single-pass) kernel, a warp-per-row kernel, and a fast-math variant. Every kernel is verified against a CPU reference and timed with CUDA events over five experiments.
 
-Evaluation Theme: 10 – Softmax and Kernel Fusion
+---
 
-A CUDA-based study of row-wise Softmax used in classifiers and attention mechanisms. The project implements and compares separate CUDA kernels, a fused shared-memory kernel, online Softmax, warp-per-row processing and a fast-math variant.
+## Results at a glance
 
-All implementations are verified against a CPU reference and benchmarked using CUDA events across five experiments.
+![Speedup of each kernel version over three separate kernels, by row length](results/speedup_vs_cols.png)
 
-⸻
+*Speedup over three separate kernels for different row lengths (4096 rows). Higher is better; 1 means no gain.*
 
-Contents
+| Matrix (rows x cols) | Separate (ms) | Fused (ms) | Speedup |
+|---|---|---|---|
+| 4096 x 1024 | 0.074 | 0.039 | 1.89x |
+| 4096 x 2048 | 0.326 | 0.178 | 1.83x |
+| 2048 x 8192 | 0.694 | 0.494 | 1.41x |
+| 4096 x 4096 | 0.702 | 0.364 | 1.93x |
+| 8192 x 2048 | 0.687 | 0.356 | 1.93x |
 
-1. Problem
-2. Kernel Design
-3. Repository Layout
-4. Test Machine
-5. Build and Run
-6. Screenshots from Actual Runs
-7. Results
-8. Analysis
-9. Correctness
-10. Limitations
-11. Future Work
+All 139 verified kernel runs match the CPU reference (worst error 3.0e-08).
 
-⸻
+---
+## Contents
 
-1. Problem
+1. [Problem](#1-problem)
+2. [Kernel design](#2-kernel-design)
+3. [Repository layout](#3-repository-layout)
+4. [Test machine](#4-test-machine)
+5. [Build and run, step by step](#5-build-and-run-step-by-step)
+6. [Screenshots from the actual runs](#6-screenshots-from-the-actual-runs)
+7. [Results (Python-generated)](#7-results-python-generated)
+8. [Analysis](#8-analysis)
+9. [Correctness](#9-correctness)
+10. [Limitations](#10-limitations)
+11. [Future work](#11-future-work)
+12. [Troubleshooting](#12-troubleshooting)
+13. [Other deliverables](#13-other-deliverables)
 
-For each row of a matrix, Softmax converts input values into probabilities.
+---
 
-The mathematical formula is:
+## 1. Problem
 
-[
-\operatorname{softmax}(x)_i =
-\frac{\exp(x_i-m)}
-{\sum_j \exp(x_j-m)}
-]
+For each row x of a matrix, softmax(x)_i = exp(x_i - m) / sum_j exp(x_j - m), where m is the row maximum (subtracting m keeps exp() from overflowing). Each row needs two reductions (max, sum) and one element-wise pass. Done as separate kernels, the matrix travels through global memory several times; softmax does very little arithmetic per byte, so the layer is memory-bound and **kernel fusion** (fewer trips through memory) is the main optimisation. Softmax appears in every classifier output and in attention (one softmax per row of the QK^T score matrix).
 
-where (m) is the maximum value in the row.
+## 2. Kernel design
 
-Subtracting the maximum helps prevent numerical overflow during exponential calculations.
+```mermaid
+flowchart LR
+    A["Input matrix<br/>random float32<br/>rows x columns"] --> B["Host code on the CPU<br/>C++ / CUDA<br/>copy data, launch kernels"]
+    B --> C["GPU kernels<br/>one block of threads per row"]
+    C --> D["Output<br/>softmax probabilities"]
+    D --> E["Benchmarking<br/>CUDA event timing<br/>CPU check, results/data.csv"]
+    E --> F["Python<br/>graphs, README, slides"]
+```
 
-Softmax involves three main operations:
+*Project workflow: the CPU prepares data and launches kernels, the GPU computes softmax, and the results are checked and timed.*
 
-1. Finding the maximum value in each row.
-2. Calculating exponential values and their sum.
-3. Normalising the values to obtain probabilities.
+```mermaid
+flowchart LR
+    subgraph SEP["Separate: 3 kernels, 4 global memory accesses per element"]
+        direction LR
+        X1[("Global memory<br/>input x")] -->|"read 1"| K1["k_max<br/>row maximum"]
+        K1 --> K2["k_sumexp<br/>sum of exp(x - max)<br/>reads x again"]
+        K2 --> K3["k_norm<br/>divide by sum<br/>reads x again"]
+        K3 -->|"write"| Y1[("Global memory<br/>output y")]
+    end
+    subgraph FUS["Fused: 1 kernel, 2 global memory accesses per element"]
+        direction LR
+        X2[("Global memory<br/>input x")] -->|"read once"| F1["k_fused<br/>row kept in shared memory<br/>max, then sum, then normalise"]
+        F1 -->|"write once"| Y2[("Global memory<br/>output y")]
+    end
+```
 
-When implemented using separate CUDA kernels, the input matrix is accessed multiple times through GPU global memory.
+*Separate kernels re-read the row from slow global memory three times; the fused kernel reads it once and works from fast shared memory.*
 
-Since Softmax performs relatively little computation per memory access, reducing memory traffic is an important optimisation.
+| Variant | Global accesses per element | Idea |
+|---|---|---|
+| **Separate** (3 kernels) | 4 (read x three times, write y once) | `k_max`, `k_sumexp`, `k_norm`, one block per row, warp-shuffle + shared-memory block reduction |
+| **Fused (shared memory)** | 2 (one read, one write) | One block per row; row cached in shared memory; max and sum use the same block reduction (C x 4 bytes of shared memory, up to 48 KB) |
+| **Online softmax** | 3 | Running max and rescaled running sum in one pass, then one write pass (no shared-memory row cache) |
+| **Warp-per-row** | 2 | One warp per row, 32 values per lane kept in registers, no `__syncthreads` (rows up to 1024 columns) |
+| **Fused + `__expf`** | 2 | Fused kernel using the hardware fast exponential; accuracy trade-off measured |
 
-Project Objective:
+Timing: CUDA events, 3 warm-up runs, then the average of 30 runs. The "bytes moved" columns are ideal counts (accesses x elements x 4 bytes), used to compute effective bandwidth.
 
-To implement and optimise row-wise Softmax using CUDA by exploring different GPU processing techniques, reducing memory access and improving execution performance while maintaining numerical correctness.
+## 3. Repository layout
 
-Softmax is commonly used in:
-
-* Classification models to convert output scores into probabilities.
-* Transformer attention mechanisms to normalise attention scores.
-
-2. Kernel Design
-
-The project implements five CUDA kernel variants.
-
-Variant	Global accesses per element	Implementation
-Separate	4	Uses three kernels: k_max, k_sumexp and k_norm
-Fused (Shared Memory)	2	Combines operations into one kernel and stores the row in shared memory
-Online Softmax	3	Maintains a running maximum and rescaled sum
-Warp-per-row	2	Assigns one warp to each row and uses registers
-Fused + __expf	2	Uses a faster approximate exponential function
-
-2.1 Separate Kernels
-
-The traditional implementation uses three separate CUDA kernels:
-
-* k_max: Finds the maximum value in each row.
-* k_sumexp: Calculates the sum of exponential values.
-* k_norm: Normalises the values to produce the final output.
-
-Each row is processed by one CUDA block. Warp shuffle operations and shared memory are used for reductions.
-
-2.2 Fused Softmax Using Shared Memory
-
-This implementation combines the three operations into a single CUDA kernel.
-
-Working:
-
-1. Load the row into shared memory.
-2. Find the maximum value.
-3. Calculate exponential values and their sum.
-4. Normalise the values.
-5. Write the final output.
-
-This reduces global memory accesses from four to two per element.
-
-The implementation requires the row to fit in shared memory, with a maximum of 48 KB in the configured implementation.
-
-2.3 Online Softmax
-
-Online Softmax maintains two running values:
-
-* Running maximum.
-* Running sum.
-
-When a larger value is encountered, the running sum is adjusted accordingly.
-
-This allows the maximum and exponential sum to be calculated in one pass, followed by a separate output pass.
-
-2.4 Warp-per-row
-
-In this implementation, one GPU warp processes one row.
-
-A warp consists of 32 GPU threads. Intermediate values are stored in registers, reducing the need for shared memory and block-wide synchronisation.
-
-The implementation supports rows up to 1024 columns.
-
-2.5 Fast Math
-
-This implementation uses NVIDIA’s __expf() function instead of the standard expf() function.
-
-It provides a faster approximate exponential calculation, and its execution time and numerical accuracy are compared with the standard fused implementation.
-
-Benchmarking Method: CUDA events are used for timing, with 3 warm-up runs followed by an average of 30 runs.
-
-The memory bandwidth calculations use estimated memory traffic based on the number of global memory accesses.
-
-3. Repository Layout
-
+```
 cuda_softmax_fusion/
-│
-├── Makefile
-├── PLAN.md
-├── README.md
-│
+├── Makefile                 make gpu ARCH=sm_120
+├── PLAN.md                  project plan
+├── README.md                this file (generated by scripts/make_readme.py)
 ├── src/
-│   ├── kernels.cuh
-│   └── bench.cu
-│
+│   ├── kernels.cuh          all softmax kernels, block reductions, timing helper
+│   └── bench.cu             benchmark driver: experiments, CPU verification, CSV output
 ├── scripts/
-│   ├── run_all.sh
-│   ├── sweep.sh
-│   ├── plot.py
-│   ├── make_readme.py
-│   ├── make_ppt.py
-│   └── package.py
-│
-├── results/
-│   ├── data.csv
-│   ├── summary.md
-│   ├── figures
-│   └── logs
-│
-├── docs/
-│   └── screenshots/
-│
-└── presentation/
-    └── CUDA_Softmax_Kernel_Fusion.pptx
+│   ├── run_all.sh           one command: build, run, figures, README, PPT, zip
+│   ├── sweep.sh             runs all experiments, writes results/data.csv
+│   ├── plot.py              figures and results/summary.md
+│   ├── make_readme.py       generates this README
+│   ├── make_ppt.py          generates the extended presentation
+│   ├── make_ppt10.py        generates the 10-slide presentation
+│   ├── make_ppt_compact.py  generates the 5-checkpoint presentation
+│   └── package.py           builds the results zip
+├── results/                 CSVs, PNG figures, summary.md, logs, gpu.txt
+├── docs/screenshots/        terminal screenshots (original and labelled)
+└── presentation/            PowerPoint decks (10-slide, 5-checkpoint, extended)
+```
 
-Important Files
+## 4. Test machine
 
-File	Purpose
-kernels.cuh	Contains CUDA Softmax implementations and reduction functions
-bench.cu	Runs experiments, verifies outputs and generates benchmark data
-Makefile	Compiles the CUDA program
-run_all.sh	Executes the complete project workflow
-sweep.sh	Runs all benchmark experiments
-plot.py	Generates performance graphs and result summaries
-make_readme.py	Generates the README
-make_ppt.py	Generates the PowerPoint presentation
-package.py	Packages project results
+| Item | Value |
+|---|---|
+| GPU | NVIDIA GeForce RTX 5060 Ti, 17.1 GB, 36 SMs, compute capability 12.0, L2 cache 32.0 MB |
+| Driver | ? (nvidia-smi) |
+| CUDA | nvcc release 13.3 (runtime 13030) |
+| OS | Ubuntu on WSL2 (Windows) |
+| Compiler flags | `nvcc -O3 -std=c++17 -arch=<ARCH> -lineinfo` |
 
-4. Test Machine
+## 5. Build and run, step by step
 
-Component	Configuration
-GPU	NVIDIA GeForce RTX 5060 Ti
-GPU Memory	16 GB
-CUDA Cores Architecture	Compute Capability 12.0
-Streaming Multiprocessors	36
-L2 Cache	32 MB
-CUDA Toolkit	CUDA 13.3
-Compiler	NVIDIA NVCC
-Operating System	Ubuntu on WSL2 (Windows 11)
-Programming Language	C++17 and CUDA C++
+All commands run **inside WSL** (open "Ubuntu" or type `wsl` in PowerShell first).
 
-Compiler flags:
+**Step 1. Check the GPU is visible from WSL**
 
-nvcc -O3 -std=c++17 -arch=sm_120 -lineinfo
-
-5. Build and Run, Step by Step
-
-All commands are executed inside Ubuntu on WSL.
-
-Step 1: Check GPU and CUDA Availability
-
+```bash
 nvidia-smi
 nvcc --version
+```
 
-These commands verify that the NVIDIA GPU is accessible and the CUDA compiler is installed.
+**Step 2. Copy the project into the WSL home folder and enter it**
 
-Step 2: Copy the Project into WSL
-
+```bash
 cp /mnt/c/Users/Intel/Downloads/cuda_softmax_fusion.zip ~/
-cd ~
-unzip cuda_softmax_fusion.zip
-cd cuda_softmax_fusion
+cd ~ && unzip cuda_softmax_fusion.zip && cd cuda_softmax_fusion
+```
 
-Replace Intel with the appropriate Windows username.
+(Replace `Intel` with your Windows user name: `ls /mnt/c/Users/` lists them.)
 
-Step 3: Compile the Project
+**Step 3. Build** (`sm_120` is RTX 50-series; `sm_89` RTX 40, `sm_86` RTX 30, or `ARCH=native`)
 
+```bash
 make gpu ARCH=sm_120
+```
 
-The architecture sm_120 is used for the NVIDIA RTX 50-series GPU.
+**Step 4. Run all experiments**
 
-Step 4: Execute All Experiments
-
+```bash
 bash scripts/sweep.sh
+```
 
-This executes the benchmark experiments and generates the results in CSV format.
+**Step 5. Make figures, README and presentation** (or do everything above with `bash scripts/run_all.sh`)
 
-Step 5: Generate Graphs and Reports
+```bash
+pip install matplotlib pandas numpy python-pptx pillow   # once
+python3 scripts/plot.py && python3 scripts/make_readme.py && python3 scripts/make_ppt.py
+```
 
-Install the required Python libraries:
+## 6. Screenshots from the actual runs
 
-pip install matplotlib pandas numpy python-pptx pillow
+### 6.0 GPU and CUDA environment (`nvidia-smi`, `nvcc --version`)
 
-Generate the graphs, README and presentation:
+Saved by `run_all.sh` to `results/nvidia_smi.txt` and `results/nvcc_version.txt`:
 
-python3 scripts/plot.py
-python3 scripts/make_readme.py
-python3 scripts/make_ppt.py
+```
+Wed Nov 25 18:21:43 2026       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 610.57.01              KMD Version: 610.88        CUDA UMD Version: 13.3     |
++-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA GeForce RTX 5060 Ti     On  |   00000000:02:00.0  On |                  N/A |
+|  0%   35C    P5             12W /  180W |    1394MiB /  16311MiB |      3%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
 
-Alternatively, execute the complete workflow using:
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|  No running processes found                                                             |
++-----------------------------------------------------------------------------------------+
 
-bash scripts/run_all.sh
+nvcc: NVIDIA (R) Cuda compiler driver
+Copyright (c) 2005-2026 NVIDIA Corporation
+Built on Tue_Jun_09_02:43:40_PM_PDT_2026
+Cuda compilation tools, release 13.3, V13.3.73
+Build cuda_13.3.r13.3/compiler.38244171_0
+```
 
-6. Screenshots from the Actual Runs
+### 6.1 Benchmark run: baseline sizes and row-length sweep
 
-The following screenshots document the actual GPU environment, benchmark execution and report generation.
+![Benchmark run: baseline sizes and row-length sweep](docs/screenshots/01_benchmark_run_baseline_and_colsweep_labelled.png)
 
-6.1 GPU and CUDA Environment
+| Label | Meaning |
+|---|---|
+| 1 | GPU: RTX 5060 Ti, 36 SMs, 32 MB L2, compute capability 12.0. Timing = CUDA events, 3 warm-up runs, average of 30 runs, checked against the CPU on 64 rows |
+| 2 | Baseline sizes: separate vs fused kernels. At 4096x4096, 0.7020 ms vs 0.3641 ms (1.93x). Every line says MATCH |
+| 3 | Row-length sweep, 128 to 8192 columns, five variants. Warp-per-row is fastest on short rows (4096x512: 0.0124 ms vs 0.0268 ms fused); online softmax is fastest at 8192 columns (0.7327 ms vs 0.9704 ms) |
 
-GPU: NVIDIA GeForce RTX 5060 Ti
+Original: [01_benchmark_run_baseline_and_colsweep_original.png](docs/screenshots/01_benchmark_run_baseline_and_colsweep_original.png)
 
-CUDA Toolkit: 13.3
+### 6.2 Benchmark run: block-size sweep and DRAM-bound sizes
 
-Operating System: Ubuntu on WSL2
+![Benchmark run: block-size sweep and DRAM-bound sizes](docs/screenshots/02_benchmark_run_blocksweep_and_dram_labelled.png)
 
-The environment was verified using nvidia-smi and nvcc --version.
+| Label | Meaning |
+|---|---|
+| 1 | Block-size sweep, 64 to 1024 threads. The fused kernel at 4096x8192 takes 2.8106 ms with 64 threads but 0.7236 ms with 512 |
+| 2 | DRAM-bound sizes start (268 MB matrices): at 16384x4096 fused takes 1.4299 ms vs 2.7249 ms for separate (1.91x) |
 
-6.2 Baseline Benchmark and Row-Length Sweep
+Original: [02_benchmark_run_blocksweep_and_dram_original.png](docs/screenshots/02_benchmark_run_blocksweep_and_dram_original.png)
 
-The screenshot shows:
+### 6.3 Benchmark run: DRAM-bound sizes, attention shapes, finish
 
-* GPU configuration and benchmark execution.
-* Comparison between separate and fused kernels.
-* Performance testing across row lengths from 128 to 8192 columns.
-* Correctness verification against the CPU reference.
+![Benchmark run: DRAM-bound sizes, attention shapes, finish](docs/screenshots/03_benchmark_run_dram_attention_done_labelled.png)
 
-At 4096 × 4096, the fused implementation achieves approximately 1.93× speedup.
+| Label | Meaning |
+|---|---|
+| 1 | End of the block-size sweep (4096x8192, 512 and 1024 threads) |
+| 2 | DRAM-bound sizes, three shapes, four to five variants each. Fused reaches 375.5 to 377.8 GB/s, about 84% of the 448 GB/s spec peak. All MATCH |
+| 3 | Attention-score shapes (16 heads, sequence length 128 to 2048). At 32768x2048: fused 1.4299 ms vs separate 2.7273 ms (1.91x) |
+| 4 | Run finished: results written to results/data.csv |
 
-Original screenshot: docs/screenshots/01_benchmark_run_baseline_and_colsweep_original.png
+Original: [03_benchmark_run_dram_attention_done_original.png](docs/screenshots/03_benchmark_run_dram_attention_done_original.png)
 
-6.3 Block-Size Sweep and DRAM-Bound Experiments
+### 6.4 Figures, README, PPT and zip generated
 
-The screenshot shows:
+![Figures, README, PPT and zip generated](docs/screenshots/04_report_build_labelled.png)
 
-* Testing different CUDA block sizes from 64 to 1024 threads.
-* Comparing execution time for different configurations.
-* Performance evaluation using large matrices.
+| Label | Meaning |
+|---|---|
+| 1 | The four report scripts run in one command: plot.py, make_readme.py, make_ppt.py, package.py |
+| 2 | Output: figures and summary.md, README.md, the PowerPoint and the results zip were all written |
 
-Original screenshot: docs/screenshots/02_benchmark_run_blocksweep_and_dram_original.png
+Original: [04_report_build_original.png](docs/screenshots/04_report_build_original.png)
 
-6.4 DRAM-Bound and Attention-Shape Experiments
+## 7. Results (Python-generated)
 
-The screenshot shows:
+All numbers below are produced by `scripts/plot.py` from `results/data.csv`; figures are in `results/`.
 
-* Large matrix performance measurements.
-* Effective memory bandwidth.
-* Attention-score matrix experiments.
-* Completion of benchmark execution.
+### Baseline sizes
 
-Original screenshot: docs/screenshots/03_benchmark_run_dram_attention_done_original.png
+| Rows x Cols | max | sum | norm | Separate | Fused | Speedup | Bytes sep (MB) | Bytes fused (MB) | Max err |
+|---|---|---|---|---|---|---|---|---|---|
+| 4096x1024 | 0.026 | 0.033 | 0.031 | 0.074 | 0.039 | 1.89x | 67.1 | 33.6 | 3.7e-09 |
+| 4096x2048 | 0.041 | 0.039 | 0.188 | 0.326 | 0.178 | 1.83x | 134.2 | 67.1 | 1.9e-09 |
+| 2048x8192 | 0.175 | 0.177 | 0.360 | 0.694 | 0.494 | 1.41x | 268.4 | 134.2 | 4.7e-10 |
+| 4096x4096 | 0.186 | 0.167 | 0.360 | 0.702 | 0.364 | 1.93x | 268.4 | 134.2 | 9.3e-10 |
+| 8192x2048 | 0.174 | 0.167 | 0.357 | 0.687 | 0.356 | 1.93x | 268.4 | 134.2 | 1.9e-09 |
 
-6.5 Report Generation
+### Row-length sweep (4096 rows, block 256)
 
-The screenshot shows the execution of the report-generation scripts and the creation of graphs, README and PowerPoint files.
+| Cols | 3 separate kernels | Fused (shared memory) | Online softmax | Warp-per-row | Fused + __expf |
+|---|---|---|---|---|---|
+| 128 | 0.040 | 0.024 | 0.021 | 0.010 | 0.021 |
+| 256 | 0.045 | 0.023 | 0.023 | 0.013 | 0.023 |
+| 512 | 0.068 | 0.027 | 0.030 | 0.012 | 0.027 |
+| 1024 | 0.069 | 0.038 | 0.044 | 0.022 | 0.038 |
+| 2048 | 0.344 | 0.178 | 0.186 | - | 0.186 |
+| 4096 | 0.694 | 0.374 | 0.367 | - | 0.367 |
+| 8192 | 1.366 | 0.970 | 0.733 | - | 0.988 |
 
-Original screenshot: docs/screenshots/04_report_build_original.png
+### Block-size sweep (fused kernel)
 
-7. Results
+| Cols | Best block | Best ms | Worst block | Worst ms |
+|---|---|---|---|---|
+| 1024 | 128 | 0.036 | 1024 | 0.140 |
+| 2048 | 128 | 0.178 | 1024 | 0.239 |
+| 4096 | 512 | 0.354 | 64 | 0.661 |
+| 8192 | 512 | 0.724 | 64 | 2.811 |
 
-All benchmark results are generated using scripts/plot.py from results/data.csv.
+### expf vs __expf (fused kernel)
 
-7.1 Baseline Performance Comparison
+| Cols | expf ms | expf err | __expf ms | __expf err | gain |
+|---|---|---|---|---|---|
+| 128 | 0.024 | 3.0e-08 | 0.021 | 3.0e-08 | 1.14x |
+| 256 | 0.023 | 1.5e-08 | 0.023 | 1.5e-08 | 0.98x |
+| 512 | 0.027 | 7.5e-09 | 0.027 | 7.5e-09 | 0.98x |
+| 1024 | 0.038 | 3.7e-09 | 0.038 | 3.7e-09 | 0.99x |
+| 2048 | 0.178 | 1.9e-09 | 0.186 | 1.9e-09 | 0.95x |
+| 4096 | 0.374 | 9.3e-10 | 0.367 | 9.3e-10 | 1.02x |
+| 8192 | 0.970 | 4.7e-10 | 0.988 | 4.7e-10 | 0.98x |
 
-The following table compares the traditional separate-kernel implementation with the fused implementation.
+### Figures
 
-Matrix Size	Separate (ms)	Fused (ms)	Speedup
-4096 × 1024	0.074	0.039	1.89×
-4096 × 2048	0.326	0.178	1.83×
-2048 × 8192	0.694	0.494	1.41×
-4096 × 4096	0.702	0.364	1.93×
-8192 × 2048	0.687	0.356	1.93×
+![Time of each separate kernel and the fused kernel](results/breakdown.png)
 
-The fused implementation achieves up to 1.93× speedup over the separate implementation on the tested baseline matrix sizes.
+*Time of the three separate kernels (stacked) against the single fused kernel at the baseline sizes.*
 
-7.2 Row-Length Sweep
+![Speedup over separate kernels by row length](results/speedup_vs_cols.png)
 
-The following experiment compares different Softmax implementations using 4096 rows and different column sizes.
+*Speedup over three separate kernels as the row length grows (4096 rows).*
 
-Columns	Separate	Fused	Online	Warp-per-row	Fused + __expf
-128	0.040	0.024	0.021	0.010	0.021
-256	0.045	0.023	0.023	0.013	0.023
-512	0.068	0.027	0.030	0.012	0.027
-1024	0.069	0.038	0.044	0.022	0.038
-2048	0.344	0.178	0.186	–	0.186
-4096	0.694	0.374	0.367	–	0.367
-8192	1.366	0.970	0.733	–	0.988
+![Execution time by row length](results/time_vs_cols.png)
 
-Execution times are in milliseconds.
+*Execution time of every kernel version for each row length.*
 
-7.3 Block-Size Sweep
+![Block-size sweep for the fused kernel](results/blocksize_heatmap.png)
 
-The fused implementation was tested using different CUDA block sizes.
+*Fused kernel time and speedup for block sizes 64 to 1024 threads at four row lengths; bold marks the best.*
 
-Columns	Best Block Size	Best Time (ms)	Worst Block Size	Worst Time (ms)
-1024	128	0.036	1024	0.140
-2048	128	0.178	1024	0.239
-4096	512	0.354	64	0.661
-8192	512	0.724	64	2.811
+![Effective bandwidth by row length](results/bandwidth_vs_cols.png)
 
-The results show that the best block size depends on the row length.
+*Effective bandwidth (ideal bytes divided by time). Values above the spec peak come from L2 cache hits.*
 
-7.4 Figures
+![Effective bandwidth on DRAM-bound sizes](results/bandwidth_dram.png)
 
-The following graphs are generated from the benchmark results.
+*268 MB matrices, too large for the cache: the fused kernel reaches about 375 to 378 GB/s.*
 
-Speedup vs Row Length
+![Attention-shaped matrices](results/attention.png)
 
-Execution Time vs Row Length
+*Softmax on attention-score shapes (16 heads, sequence length 128 to 2048).*
 
-Effective Bandwidth vs Row Length
+## 8. Analysis
 
-Kernel Execution Breakdown
+- Fusing the three kernels into one gave 1.41x to 1.93x on the baseline sizes. Ideal global-memory traffic falls from 4 accesses per element to 2, so about 2x is the expected ceiling for a memory-bound layer.
+- Across row lengths 128 to 8192 the fused speedup ranges from 1.41x (at 8192 columns) to 2.55x (at 512 columns).
+- Fastest variant per row length: 128 cols: Warp-per-row, 256 cols: Warp-per-row, 512 cols: Warp-per-row, 1024 cols: Warp-per-row, 2048 cols: Fused (shared memory), 4096 cols: Fused + __expf, 8192 cols: Online softmax. Differences under about 3% (for example fused vs fused + __expf) are within run-to-run noise.
+- Warp-per-row (registers, no __syncthreads) against the shared-memory fused kernel on short rows: 128 cols 2.26x, 256 cols 1.74x, 512 cols 2.17x, 1024 cols 1.70x (above 1 means warp-per-row is faster).
+- Online softmax (one pass for max and sum, 3 nominal accesses per element) is 1.58x to 2.31x faster than separate kernels. Against the shared-memory fused kernel its time is 0.76x to 1.16x (below 1 means online is faster): it wins at 128, 8192 columns, ties (within 3%) at 256, 4096.
+- Best block size of the fused kernel: 1024 cols -> 128 threads, 2048 cols -> 128 threads, 4096 cols -> 512 threads, 8192 cols -> 512 threads.
+- On DRAM-bound sizes (268 MB per matrix) the fused kernel reaches 375 to 378 GB/s effective bandwidth, up to 84% of the 448 GB/s spec peak.
+- Some DRAM-sized runs report more than the 448 GB/s peak (up to 561 GB/s, online). Effective bandwidth uses nominal accesses per element; a variant that reads the same row twice gets the second read from cache, so nominal bytes overstate its real DRAM traffic. Compare variants by time, and use the fused kernel's figure as the DRAM estimate.
+- At small sizes the effective bandwidth rises to 1509 GB/s, above the DRAM peak. The matrix fits in the GPU's L2 cache and the timing loop re-reads it from there, so these numbers show cache speed, not DRAM speed.
+- Replacing expf with __expf changed the fused time by 0.95x to 1.14x, with a worst error of 3.0e-08 against 3.0e-08 for expf. The median change is 0.98x, i.e. no consistent gain, which fits a memory-bound layer: a cheaper exponential does not help when the kernel waits on memory.
+- Correctness: 139 kernel runs were compared with a double-precision CPU softmax on 64 rows each; the worst maximum absolute error is 3.0e-08 (all MATCH).
 
-Block-Size Comparison
+Derived quantities (bytes moved / time) are estimates based on ideal traffic, not hardware counters. Reasons given for trends (for example shared-memory pressure on long rows) are hypotheses until confirmed with Nsight Compute.
 
-DRAM-Bound Performance
+## 9. Correctness
 
-Attention-Shape Performance
+Every kernel output is compared with a double-precision CPU softmax on the first 64 rows of each matrix (the output buffer is zeroed before each kernel so stale data cannot pass). Result: **all runs MATCH**, worst maximum absolute error **3.0e-08** over 139 verified runs (threshold 1e-5).
 
-8. Analysis
+## 10. Limitations
 
-The experiments provide the following observations:
+- One GPU, one machine; synthetic uniform random data in [-10, 10], not real model activations.
+- Each configuration is timed as a loop of 30 launches on the same data, so matrices that fit in the L2 cache are served from cache; the DRAM-bound experiment uses 268 MB matrices to avoid this.
+- Per-kernel times of the separate version are measured standalone (each kernel looped on its own); their sum can differ slightly from the measured sequence time.
+- Only the first 64 rows are verified against the CPU, to keep the 268 MB cases practical.
+- The fused kernel needs the row in shared memory (at most 12,288 columns); longer rows need a fallback.
+- Run-to-run variance exists (other processes, GPU clocks); results should be read as ranges, not exact constants.
 
-1. Kernel Fusion: Combining three separate kernels into one reduces global memory accesses from four to two per element. The fused implementation achieves 1.41× to 1.93× speedup on baseline sizes.
-2. Row-Length Dependency: Different implementations perform differently depending on the number of columns in each row.
-3. Warp-per-row: Performs well for smaller rows because it uses registers and avoids block-wide synchronisation.
-4. Online Softmax: Performs particularly well for larger rows, achieving the best measured time at 8192 columns.
-5. Block Size: The optimal number of threads changes with row length. Smaller block sizes work better for some configurations, while larger blocks perform better for others.
-6. Fast Math: Replacing expf() with __expf() does not provide a consistent performance improvement across all tested configurations.
-7. Memory Bandwidth: On large DRAM-bound matrices, the fused kernel achieves approximately 375–378 GB/s effective bandwidth, around 84% of the specified 448 GB/s peak.
-8. Cache Effects: Smaller matrices can fit into the GPU’s L2 cache, which can result in calculated effective bandwidth values higher than the physical DRAM bandwidth.
+## 11. Future work
 
-The memory bandwidth values are estimates based on ideal memory traffic rather than direct hardware-counter measurements.
+- Register/shared-memory hybrid and vectorised (`float4`) loads for the fused kernel.
+- A fallback for rows longer than shared memory (two-pass or online with block cooperation across rows).
+- Fusing softmax into the attention score computation so the score matrix is never written (FlashAttention-style).
+- Profile with Nsight Compute (DRAM throughput, achieved occupancy) to confirm the explanations above.
 
-Overall, the results demonstrate that kernel fusion reduces memory traffic, while the choice of the best implementation depends on the workload.
+## 12. Troubleshooting
 
-9. Correctness
+| Symptom | Fix |
+|---|---|
+| `nvidia-smi: command not found` in WSL | Update the Windows NVIDIA driver and run `wsl --update`; do not install a Linux driver inside WSL |
+| `nvcc: command not found` | `export PATH=/usr/local/cuda/bin:$PATH` (add to `~/.bashrc`) |
+| `no kernel image is available` | Wrong `ARCH`; use `ARCH=sm_120` for RTX 50, or `ARCH=native` |
+| `python3 -m venv` fails | `sudo apt install python3-venv` |
+| Results look noisy | Close games and browser tabs with video; rerun |
 
-Every CUDA implementation is compared against a double-precision CPU Softmax reference.
+## 13. Other deliverables
 
-The verification process:
-
-1. Generate input data.
-2. Calculate the reference output using the CPU.
-3. Execute the CUDA implementation.
-4. Compare the GPU output with the CPU reference.
-5. Calculate the maximum absolute error.
-
-The first 64 rows of each tested matrix are used for CPU verification.
-
-Verification Results:
-
-Parameter	Result
-Total verified kernel runs	139
-Maximum absolute error	3.0 × 10⁻⁸
-Accepted error threshold	1 × 10⁻⁵
-Verification status	All MATCH
-
-All 139 verified kernel runs passed the numerical correctness threshold.
-
-10. Limitations
-
-* Experiments were conducted on one GPU and one machine.
-* Synthetic random input data in the range [-10, 10] was used instead of real neural-network activations.
-* Matrices that fit into the L2 cache may be served from cache during repeated benchmark runs.
-* Only the first 64 rows of each matrix are verified against the CPU reference.
-* The fused implementation requires the row to fit into shared memory, limiting the supported row size to 12,288 columns under the configured 48 KB shared-memory limit.
-* GPU clock variations and other running processes can affect execution time.
-
-11. Future Work
-
-The following improvements can be explored in future versions:
-
-* Implement vectorised memory loading using float4 for improved memory access.
-* Explore hybrid register and shared-memory implementations.
-* Develop a fallback implementation for rows exceeding the shared-memory limit.
-* Integrate Softmax directly into attention-score computation to avoid writing intermediate score matrices.
-* Use NVIDIA Nsight Compute to analyse memory throughput, register usage and GPU occupancy.
-
-⸻
-
+- `presentation/CUDA_Softmax_Kernel_Fusion_10slides.pptx` - 10-slide presentation.
+- `presentation/CUDA_Softmax_Kernel_Fusion_5CP.pptx` - 5-checkpoint version (one slide per lab checkpoint).
+- `presentation/CUDA_Softmax_Kernel_Fusion.pptx` - extended deck with all experiments.
+- `results/` - raw CSV, logs and all figures; `results/summary.md` has the tables.

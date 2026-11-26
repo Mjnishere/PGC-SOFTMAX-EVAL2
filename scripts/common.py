@@ -6,7 +6,7 @@ PEAK = float(os.environ.get("PEAK_GBPS", "448"))          # RTX 5060 Ti spec pea
 COL = {"separate": "#8696AB", "fused_smem": "#35D0BA", "online": "#F2B544", "warp_row": "#7AA2F7", "fused_fast": "#F07178", "torch": "#C3A6FF"}
 LAB = {"separate": "3 separate kernels", "fused_smem": "Fused (shared memory)", "online": "Online softmax", "warp_row": "Warp-per-row",
        "fused_fast": "Fused + __expf", "torch": "PyTorch softmax"}
-VARS = ["separate", "fused_smem", "online", "warp_row", "fused_fast", "torch"]
+VARS = ["separate", "fused_smem", "online", "warp_row", "fused_fast"]
 
 def load():
     df = pd.read_csv(os.path.join(RES, "data.csv"))

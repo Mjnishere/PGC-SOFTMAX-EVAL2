@@ -15,7 +15,6 @@ memory-bound and the main optimisation is **kernel fusion**: fewer trips through
 | Online softmax | 3 | running max + rescaled sum in one pass |
 | Warp-per-row | 2 | one warp per row, values in registers (cols <= 1024) |
 | Fused + __expf | 2 | fast-math exponential, accuracy trade-off |
-| PyTorch softmax | - | library baseline (optional) |
 
 ## 3. Experiments
 1. Baseline sizes (5 matrices)  2. Row-length sweep 128..8192 (4096 rows)  3. Block-size sweep 64..1024

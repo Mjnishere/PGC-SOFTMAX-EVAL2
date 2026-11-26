@@ -18,15 +18,29 @@ for i, s_ in enumerate(shots):
     parts.append(f"### 6.{i+1} {TITLES.get(key, key)}\n\n![{TITLES.get(key, key)}](docs/screenshots/{base})\n\n{t}\nOriginal: [{key}_original.png](docs/screenshots/{key}_original.png)")
 shot_md = "\n\n".join(parts)
 img = lambda n, alt: f"![{alt}](results/{n})" if os.path.exists(os.path.join(RES, n)) else ""
+glance_rows = "\n".join(f"| {r} x {c} | {ms(df,'baseline','separate',r,c):.3f} | {ms(df,'baseline','fused_smem',r,c):.3f} | {x:.2f}x |" for (r, c), x in zip(S["base_sizes"], S["base_speed"]))
 R = f"""# Softmax and Kernel Fusion in CUDA
 
 **Parallel & Distributed Computing Laboratory** · KLE Technological University (KLETECH), Hubballi
-**Team:** Mudit Nayak · Kartik · Manoj · Vinayak  ·  **Evaluation theme:** 10 (Softmax and Kernel Fusion)  ·  **Guide / date:** _[add guide name and date]_
+**Team:** Mudit Nayak · Kartik · Manoj · Vinayak  ·  **Evaluation theme:** 10 (Softmax and Kernel Fusion)
 
-A CUDA study of the row-wise softmax used in classifiers and attention: three separate kernels, a fused shared-memory kernel, an online (single-pass) kernel, a warp-per-row kernel, a fast-math variant and a PyTorch library baseline. Every kernel is verified against a CPU reference and timed with CUDA events over five experiments.
+A CUDA study of the row-wise softmax used in classifiers and attention: three separate kernels, a fused shared-memory kernel, an online (single-pass) kernel, a warp-per-row kernel, and a fast-math variant. Every kernel is verified against a CPU reference and timed with CUDA events over five experiments.
 
 ---
 
+## Results at a glance
+
+![Speedup of each kernel version over three separate kernels, by row length](results/speedup_vs_cols.png)
+
+*Speedup over three separate kernels for different row lengths (4096 rows). Higher is better; 1 means no gain.*
+
+| Matrix (rows x cols) | Separate (ms) | Fused (ms) | Speedup |
+|---|---|---|---|
+{glance_rows}
+
+All {S['n_checked']} verified kernel runs match the CPU reference (worst error {S['maxerr']:.1e}).
+
+---
 ## Contents
 
 1. [Problem](#1-problem)
@@ -51,6 +65,35 @@ For each row x of a matrix, softmax(x)_i = exp(x_i - m) / sum_j exp(x_j - m), wh
 
 ## 2. Kernel design
 
+```mermaid
+flowchart LR
+    A["Input matrix<br/>random float32<br/>rows x columns"] --> B["Host code on the CPU<br/>C++ / CUDA<br/>copy data, launch kernels"]
+    B --> C["GPU kernels<br/>one block of threads per row"]
+    C --> D["Output<br/>softmax probabilities"]
+    D --> E["Benchmarking<br/>CUDA event timing<br/>CPU check, results/data.csv"]
+    E --> F["Python<br/>graphs, README, slides"]
+```
+
+*Project workflow: the CPU prepares data and launches kernels, the GPU computes softmax, and the results are checked and timed.*
+
+```mermaid
+flowchart LR
+    subgraph SEP["Separate: 3 kernels, 4 global memory accesses per element"]
+        direction LR
+        X1[("Global memory<br/>input x")] -->|"read 1"| K1["k_max<br/>row maximum"]
+        K1 --> K2["k_sumexp<br/>sum of exp(x - max)<br/>reads x again"]
+        K2 --> K3["k_norm<br/>divide by sum<br/>reads x again"]
+        K3 -->|"write"| Y1[("Global memory<br/>output y")]
+    end
+    subgraph FUS["Fused: 1 kernel, 2 global memory accesses per element"]
+        direction LR
+        X2[("Global memory<br/>input x")] -->|"read once"| F1["k_fused<br/>row kept in shared memory<br/>max, then sum, then normalise"]
+        F1 -->|"write once"| Y2[("Global memory<br/>output y")]
+    end
+```
+
+*Separate kernels re-read the row from slow global memory three times; the fused kernel reads it once and works from fast shared memory.*
+
 | Variant | Global accesses per element | Idea |
 |---|---|---|
 | **Separate** (3 kernels) | 4 (read x three times, write y once) | `k_max`, `k_sumexp`, `k_norm`, one block per row, warp-shuffle + shared-memory block reduction |
@@ -58,7 +101,6 @@ For each row x of a matrix, softmax(x)_i = exp(x_i - m) / sum_j exp(x_j - m), wh
 | **Online softmax** | 3 | Running max and rescaled running sum in one pass, then one write pass (no shared-memory row cache) |
 | **Warp-per-row** | 2 | One warp per row, 32 values per lane kept in registers, no `__syncthreads` (rows up to 1024 columns) |
 | **Fused + `__expf`** | 2 | Fused kernel using the hardware fast exponential; accuracy trade-off measured |
-| **PyTorch** `torch.softmax` | n/a | Library baseline (optional, `INSTALL_TORCH=1`) |
 
 Timing: CUDA events, 3 warm-up runs, then the average of 30 runs. The "bytes moved" columns are ideal counts (accesses x elements x 4 bytes), used to compute effective bandwidth.
 
@@ -75,14 +117,15 @@ cuda_softmax_fusion/
 ├── scripts/
 │   ├── run_all.sh           one command: build, run, figures, README, PPT, zip
 │   ├── sweep.sh             runs all experiments, writes results/data.csv
-│   ├── bench_torch.py       PyTorch baseline (optional)
 │   ├── plot.py              figures and results/summary.md
 │   ├── make_readme.py       generates this README
-│   ├── make_ppt.py          generates the presentation
+│   ├── make_ppt.py          generates the extended presentation
+│   ├── make_ppt10.py        generates the 10-slide presentation
+│   ├── make_ppt_compact.py  generates the 5-checkpoint presentation
 │   └── package.py           builds the results zip
 ├── results/                 CSVs, PNG figures, summary.md, logs, gpu.txt
 ├── docs/screenshots/        terminal screenshots (original and labelled)
-└── presentation/            CUDA_Softmax_Kernel_Fusion.pptx
+└── presentation/            PowerPoint decks (10-slide, 5-checkpoint, extended)
 ```
 
 ## 4. Test machine
@@ -92,7 +135,7 @@ cuda_softmax_fusion/
 | GPU | {GPU}, {g.get('MemGB','?')} GB, {g.get('SMs','?')} SMs, compute capability {g.get('CC','?')}, L2 cache {g.get('L2 MB','?')} MB |
 | Driver | {driver_ver()} (nvidia-smi) |
 | CUDA | nvcc release {cuda_release()} (runtime {g.get('Runtime','?')}) |
-| OS | Ubuntu on WSL2 (Windows 11) |
+| OS | Ubuntu on WSL2 (Windows) |
 | Compiler flags | `nvcc -O3 -std=c++17 -arch=<ARCH> -lineinfo` |
 
 ## 5. Build and run, step by step
@@ -134,8 +177,6 @@ pip install matplotlib pandas numpy python-pptx pillow   # once
 python3 scripts/plot.py && python3 scripts/make_readme.py && python3 scripts/make_ppt.py
 ```
 
-Optional PyTorch comparison: `INSTALL_TORCH=1 bash scripts/run_all.sh`.
-
 ## 6. Screenshots from the actual runs
 
 {shot_md}
@@ -148,19 +189,33 @@ All numbers below are produced by `scripts/plot.py` from `results/data.csv`; fig
 
 ### Figures
 
-{img('speedup_vs_cols.png','speedup vs row length')}
+{img('breakdown.png','Time of each separate kernel and the fused kernel')}
 
-{img('time_vs_cols.png','time vs row length')}
+*Time of the three separate kernels (stacked) against the single fused kernel at the baseline sizes.*
 
-{img('bandwidth_vs_cols.png','bandwidth vs row length')}
+{img('speedup_vs_cols.png','Speedup over separate kernels by row length')}
 
-{img('breakdown.png','stage breakdown')}
+*Speedup over three separate kernels as the row length grows (4096 rows).*
 
-{img('blocksize_heatmap.png','block-size sweep')}
+{img('time_vs_cols.png','Execution time by row length')}
 
-{img('bandwidth_dram.png','DRAM-bound sizes')}
+*Execution time of every kernel version for each row length.*
 
-{img('attention.png','attention shapes')}
+{img('blocksize_heatmap.png','Block-size sweep for the fused kernel')}
+
+*Fused kernel time and speedup for block sizes 64 to 1024 threads at four row lengths; bold marks the best.*
+
+{img('bandwidth_vs_cols.png','Effective bandwidth by row length')}
+
+*Effective bandwidth (ideal bytes divided by time). Values above the spec peak come from L2 cache hits.*
+
+{img('bandwidth_dram.png','Effective bandwidth on DRAM-bound sizes')}
+
+*268 MB matrices, too large for the cache: the fused kernel reaches about 375 to 378 GB/s.*
+
+{img('attention.png','Attention-shaped matrices')}
+
+*Softmax on attention-score shapes (16 heads, sequence length 128 to 2048).*
 
 ## 8. Analysis
 
@@ -196,12 +251,13 @@ Every kernel output is compared with a double-precision CPU softmax on the first
 | `nvcc: command not found` | `export PATH=/usr/local/cuda/bin:$PATH` (add to `~/.bashrc`) |
 | `no kernel image is available` | Wrong `ARCH`; use `ARCH=sm_120` for RTX 50, or `ARCH=native` |
 | `python3 -m venv` fails | `sudo apt install python3-venv` |
-| PyTorch says CUDA unavailable | Install the `cu128` build: `INSTALL_TORCH=1 bash scripts/run_all.sh` |
 | Results look noisy | Close games and browser tabs with video; rerun |
 
 ## 13. Other deliverables
 
-- `presentation/CUDA_Softmax_Kernel_Fusion.pptx` - slide deck with the measured results.
+- `presentation/CUDA_Softmax_Kernel_Fusion_10slides.pptx` - 10-slide presentation.
+- `presentation/CUDA_Softmax_Kernel_Fusion_5CP.pptx` - 5-checkpoint version (one slide per lab checkpoint).
+- `presentation/CUDA_Softmax_Kernel_Fusion.pptx` - extended deck with all experiments.
 - `results/` - raw CSV, logs and all figures; `results/summary.md` has the tables.
 """
 open(os.path.join(ROOT, "README.md"), "w").write(R); print("README.md written")
